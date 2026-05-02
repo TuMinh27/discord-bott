@@ -1,5 +1,8 @@
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
+const axios = require('axios');
+const sharp = require('sharp');
+const Tesseract = require('tesseract.js');
 
 const client = new Client({
   intents: [
@@ -18,7 +21,6 @@ function saveData() {
   fs.writeFileSync('data.json', JSON.stringify(data, null, 2));
 }
 
-// format số đẹp
 function format(num) {
   return num.toLocaleString("vi-VN");
 }
@@ -32,6 +34,50 @@ client.on('messageCreate', async (message) => {
 
   const args = message.content.trim().split(/\s+/);
 
+  // ===== OCR IMAGE =====
+  if (message.attachments.size > 0) {
+    try {
+      const file = message.attachments.first();
+
+      const res = await axios.get(file.url, { responseType: 'arraybuffer' });
+      fs.writeFileSync('input.png', res.data);
+
+      // ===== CẮT ẢNH QUÂN =====
+      await cropTroopImage('input.png', 'troop.png');
+      let text = await readNumbers('troop.png');
+      let troops = extractTroops(text);
+
+      let resources = null;
+
+      // ===== NẾU KHÔNG PHẢI QUÂN → ĐỌC TÀI NGUYÊN =====
+      if (!troops) {
+        await cropResourceImage('input.png', 'res.png');
+        text = await readNumbers('res.png');
+        resources = extractResources(text);
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle("📊 Kết quả đọc ảnh")
+        .addFields(
+          { name: "⚔️ Bộ", value: format(troops?.infantry || 0), inline: true },
+          { name: "🐎 Kỵ", value: format(troops?.cavalry || 0), inline: true },
+          { name: "🏹 Cung", value: format(troops?.archer || 0), inline: true },
+          { name: "💣 Công thành", value: format(troops?.siege || 0), inline: true },
+          { name: "🌾 Food", value: format(resources?.food || 0), inline: true },
+          { name: "🌲 Wood", value: format(resources?.wood || 0), inline: true },
+          { name: "🪨 Stone", value: format(resources?.stone || 0), inline: true },
+          { name: "🪙 Gold", value: format(resources?.gold || 0), inline: true }
+        )
+        .setColor("Green");
+
+      return message.reply({ embeds: [embed] });
+
+    } catch (err) {
+      console.error(err);
+      return message.reply("❌ Lỗi đọc ảnh");
+    }
+  }
+
   // ===== REPORT =====
   if (args[0] === "!report") {
     const user = message.author.username;
@@ -44,7 +90,7 @@ client.on('messageCreate', async (message) => {
     const gold = parseInt(args[6]);
 
     if (!acc || isNaN(troop)) {
-      return message.reply("❌ Sai format!\nDùng: !report acc troop food wood stone gold");
+      return message.reply("❌ Sai format!\n!report acc troop food wood stone gold");
     }
 
     if (!data[user]) data[user] = {};
@@ -52,20 +98,7 @@ client.on('messageCreate', async (message) => {
 
     saveData();
 
-    const embed = new EmbedBuilder()
-      .setTitle("✅ Báo cáo thành công")
-      .setDescription(`Acc: **${acc}**`)
-      .addFields(
-        { name: "👤 Người gửi", value: user, inline: true },
-        { name: "⚔️ Quân", value: format(troop), inline: true },
-        { name: "🍖 Food", value: format(food), inline: true },
-        { name: "🌲 Wood", value: format(wood), inline: true },
-        { name: "🪨 Stone", value: format(stone), inline: true },
-        { name: "🪙 Gold", value: format(gold), inline: true }
-      )
-      .setColor("Green");
-
-    message.reply({ embeds: [embed] });
+    return message.reply("✅ Đã lưu dữ liệu");
   }
 
   // ===== TOTAL =====
@@ -81,15 +114,7 @@ client.on('messageCreate', async (message) => {
       }
     }
 
-    const embed = new EmbedBuilder()
-      .setTitle("📊 Tổng thống kê")
-      .addFields(
-        { name: "⚔️ Tổng quân", value: format(totalTroop), inline: true },
-        { name: "📦 Tổng tài nguyên", value: format(totalRes), inline: true }
-      )
-      .setColor("Blue");
-
-    message.reply({ embeds: [embed] });
+    return message.reply(`📊 Tổng quân: ${format(totalTroop)}\n📦 Tổng tài nguyên: ${format(totalRes)}`);
   }
 
   // ===== TOP =====
@@ -107,17 +132,12 @@ client.on('messageCreate', async (message) => {
 
     list.sort((a, b) => b.troop - a.troop);
 
-    let desc = "";
+    let msg = "🏆 BXH quân:\n";
     list.slice(0, 10).forEach((x, i) => {
-      desc += `**${i + 1}.** ${x.name} - ${format(x.troop)}\n`;
+      msg += `${i + 1}. ${x.name}: ${format(x.troop)}\n`;
     });
 
-    const embed = new EmbedBuilder()
-      .setTitle("🏆 BXH Quân Đội")
-      .setDescription(desc || "Chưa có dữ liệu")
-      .setColor("Gold");
-
-    message.reply({ embeds: [embed] });
+    return message.reply(msg);
   }
 
   // ===== CHECK =====
@@ -125,29 +145,90 @@ client.on('messageCreate', async (message) => {
     const minTroop = parseInt(args[1]);
 
     if (isNaN(minTroop)) {
-      return message.reply("❌ Dùng: !check số_quân_tối_thiểu");
+      return message.reply("❌ !check số_quân");
     }
 
     let thiếu = [];
 
     for (let user in data) {
       for (let acc in data[user]) {
-        let t = data[user][acc].troop;
-        if (t < minTroop) {
-          thiếu.push(`${user} (${acc}) - ${format(t)}`);
+        if (data[user][acc].troop < minTroop) {
+          thiếu.push(`${user} (${acc})`);
         }
       }
     }
 
-    const embed = new EmbedBuilder()
-      .setTitle("⚠️ Danh sách chưa đạt")
-      .setDescription(thiếu.length ? thiếu.join("\n") : "✅ Tất cả đạt yêu cầu")
-      .setColor("Red");
-
-    message.reply({ embeds: [embed] });
+    return message.reply(
+      thiếu.length ? `⚠️ Chưa đạt:\n${thiếu.join("\n")}` : "✅ Tất cả đạt"
+    );
   }
-
 });
 
-// dùng biến môi trường (Railway)
+// ===== IMAGE PROCESS =====
+async function cropTroopImage(input, output) {
+  const img = sharp(input);
+  const meta = await img.metadata();
+
+  await img.extract({
+    left: Math.floor(meta.width * 0.15),
+    top: Math.floor(meta.height * 0.45),
+    width: Math.floor(meta.width * 0.7),
+    height: Math.floor(meta.height * 0.25)
+  }).grayscale().normalize().sharpen().toFile(output);
+}
+
+async function cropResourceImage(input, output) {
+  const img = sharp(input);
+  const meta = await img.metadata();
+
+  await img.extract({
+    left: Math.floor(meta.width * 0.55),
+    top: Math.floor(meta.height * 0.25),
+    width: Math.floor(meta.width * 0.35),
+    height: Math.floor(meta.height * 0.5)
+  }).grayscale().normalize().sharpen().toFile(output);
+}
+
+async function readNumbers(path) {
+  const result = await Tesseract.recognize(path, 'eng', {
+    tessedit_char_whitelist: '0123456789.MB'
+  });
+  return result.data.text;
+}
+
+function cleanNumber(str) {
+  if (!str) return 0;
+
+  str = str.replace(/[^0-9.MB]/g, "");
+
+  if (str.includes("B")) return parseFloat(str) * 1e9;
+  if (str.includes("M")) return parseFloat(str) * 1e6;
+
+  return parseInt(str);
+}
+
+function extractTroops(text) {
+  const nums = text.match(/[\d.]+/g);
+  if (!nums || nums.length < 4) return null;
+
+  return {
+    infantry: cleanNumber(nums[0]),
+    cavalry: cleanNumber(nums[1]),
+    archer: cleanNumber(nums[2]),
+    siege: cleanNumber(nums[3])
+  };
+}
+
+function extractResources(text) {
+  const nums = text.match(/[\d.]+[MB]?/g);
+  if (!nums || nums.length < 4) return null;
+
+  return {
+    food: cleanNumber(nums[0]),
+    wood: cleanNumber(nums[1]),
+    stone: cleanNumber(nums[2]),
+    gold: cleanNumber(nums[3])
+  };
+}
+
 client.login(process.env.TOKEN);
